@@ -407,6 +407,9 @@ class _SchemaGenerator:
                 # string (e.g. "1") rather than its name. Decoding also accepts
                 # the encoded name as an alias, but that leniency is not part of
                 # the schema, matching how the encoder never emits it.
+                # Defaults go through `to_builtins(str_keys=True)`, which applies
+                # the same rule, so a nested int-keyed struct default is rendered
+                # with the keys its own schema declares.
                 if field.int_key is not None:
                     key = str(field.int_key)
                 else:

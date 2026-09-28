@@ -344,6 +344,7 @@ def check_struct_attributes() -> None:
         y: int
 
     assert_type(Point.__struct_fields__, tuple[str, ...])
+    assert_type(Point.__struct_encode_int_keys__, tuple[int | None, ...] | None)
 
     for field in Point.__match_args__:
         # mypy inferences `field` as `str`,

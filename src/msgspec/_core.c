@@ -1212,20 +1212,23 @@ IntLookup_GetUInt64OrError(IntLookup *self, uint64_t key, PathNode *path) {
     );
 }
 
+/* Look up a Python `int` key. Returns a borrowed reference, or NULL (with no
+ * exception set) when the key is missing or doesn't fit in 64 bits. */
 static PyObject *
-IntLookup_GetPyIntOrError(IntLookup *self, PyObject *key, PathNode *path) {
+IntLookup_GetPyInt(IntLookup *self, PyObject *key) {
     uint64_t x;
     bool neg, overflow;
-    PyObject *out = NULL;
     overflow = fast_long_extract_parts(key, &neg, &x);
-    if (!overflow) {
-        if (neg) {
-            out = IntLookup_GetInt64(self, -(int64_t)x);
-        }
-        else {
-            out = IntLookup_GetUInt64(self, x);
-        }
+    if (overflow) return NULL;
+    if (neg) {
+        return IntLookup_GetInt64(self, -(int64_t)x);
     }
+    return IntLookup_GetUInt64(self, x);
+}
+
+static PyObject *
+IntLookup_GetPyIntOrError(IntLookup *self, PyObject *key, PathNode *path) {
+    PyObject *out = IntLookup_GetPyInt(self, key);
     if (out != NULL) {
         Py_INCREF(out);
         return out;
@@ -3036,7 +3039,8 @@ typedef struct {
     PyObject *struct_tag;        /* True, str, or NULL */
     PyObject *match_args;
     PyObject *rename;
-    /* int_keys: msgpack-only integer map keys. All NULL when unused. */
+    /* int_keys: integer map keys for struct fields, honored by the msgpack and
+     * JSON encoders/decoders and by `to_builtins`/`convert`. All NULL when unused. */
     PyObject *struct_int_keys;         /* merged dict {field_name: PyLong} or NULL */
     PyObject *struct_encode_int_keys;  /* tuple parallel to struct_encode_fields; PyLong or None per field, or NULL */
     PyObject *struct_int_key_lookup;   /* IntLookup int64 -> PyLong(field_index) or NULL */
@@ -13589,14 +13593,17 @@ _mp_struct_sortitem_lt(const MpStructSortItem *a, const MpStructSortItem *b) {
     return (cmp < 0) || ((cmp == 0) & (a->skey_size < b->skey_size));
 }
 
-/* Encode an int-keyed struct with `order='sorted'`. The default assoclist sorted
- * path is string-key only, so int-keyed structs get this dedicated path to keep
- * their integer keys consistent across all `order` settings. Only reached when
- * `order == ORDER_SORTED` and the struct has `int_keys`; the default (unsorted)
- * encode path is untouched. */
+/* Collect the entries of an int-keyed struct `obj` into a freshly allocated
+ * array sorted per `_mp_struct_sortitem_lt` (integer keys ascending, then string
+ * keys bytewise). Honors `omit_defaults`, skips UNSET fields, and includes the
+ * tag (as a string key) for tagged structs. Shared by the msgpack, JSON and
+ * `to_builtins` `order='sorted'` paths; only the emission differs. On success
+ * `*items_out` (possibly NULL for a fieldless struct) must be freed with
+ * PyMem_Free. Returns 0 on success, -1 (with an exception set) on error. */
 static int
-mpack_encode_struct_object_sorted_intkeys(
-    EncoderState *self, StructMetaObject *struct_type, PyObject *obj
+struct_sorted_intkey_items(
+    StructMetaObject *struct_type, PyObject *obj,
+    MpStructSortItem **items_out, Py_ssize_t *n_out
 ) {
     PyObject *tag_field = struct_type->struct_tag_field;
     PyObject *tag_value = struct_type->struct_tag_value;
@@ -13607,14 +13614,14 @@ mpack_encode_struct_object_sorted_intkeys(
     Py_ssize_t npos = nfields - PyTuple_GET_SIZE(defaults);
     bool omit_defaults = struct_type->omit_defaults == OPT_TRUE;
     Py_ssize_t cap = nfields + (tag_value != NULL);
-    int status = -1;
     MpStructSortItem *items = NULL;
 
-    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    *items_out = NULL;
+    *n_out = 0;
 
     if (cap > 0) {
         items = PyMem_Malloc(cap * sizeof(MpStructSortItem));
-        if (items == NULL) { PyErr_NoMemory(); goto cleanup; }
+        if (items == NULL) { PyErr_NoMemory(); return -1; }
     }
     Py_ssize_t n = 0;
     if (tag_value != NULL) {
@@ -13626,7 +13633,10 @@ mpack_encode_struct_object_sorted_intkeys(
     }
     for (Py_ssize_t i = 0; i < nfields; i++) {
         PyObject *val = Struct_get_index(obj, i);
-        if (MS_UNLIKELY(val == NULL)) goto cleanup;
+        if (MS_UNLIKELY(val == NULL)) {
+            PyMem_Free(items);
+            return -1;
+        }
         if (MS_UNLIKELY(val == UNSET)) continue;
         if (omit_defaults && i >= npos
                 && is_default(val, PyTuple_GET_ITEM(defaults, i - npos))) {
@@ -13657,6 +13667,28 @@ mpack_encode_struct_object_sorted_intkeys(
         }
         items[j] = tmp;
     }
+
+    *items_out = items;
+    *n_out = n;
+    return 0;
+}
+
+/* Encode an int-keyed struct with `order='sorted'`. The default assoclist sorted
+ * path is string-key only, so int-keyed structs get this dedicated path to keep
+ * their integer keys consistent across all `order` settings. Only reached when
+ * `order == ORDER_SORTED` and the struct has `int_keys`; the default (unsorted)
+ * encode path is untouched. */
+static int
+mpack_encode_struct_object_sorted_intkeys(
+    EncoderState *self, StructMetaObject *struct_type, PyObject *obj
+) {
+    int status = -1;
+    MpStructSortItem *items = NULL;
+    Py_ssize_t n = 0;
+
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+
+    if (struct_sorted_intkey_items(struct_type, obj, &items, &n) < 0) goto cleanup;
 
     if (mpack_encode_map_header(self, n, "structs") < 0) goto cleanup;
     for (Py_ssize_t i = 0; i < n; i++) {
@@ -15028,65 +15060,13 @@ static int
 json_encode_struct_object_sorted_intkeys(
     EncoderState *self, StructMetaObject *struct_type, PyObject *obj
 ) {
-    PyObject *tag_field = struct_type->struct_tag_field;
-    PyObject *tag_value = struct_type->struct_tag_value;
-    PyObject *fields = struct_type->struct_encode_fields;
-    PyObject *int_keys = struct_type->struct_encode_int_keys;
-    PyObject *defaults = struct_type->struct_defaults;
-    Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
-    Py_ssize_t npos = nfields - PyTuple_GET_SIZE(defaults);
-    bool omit_defaults = struct_type->omit_defaults == OPT_TRUE;
-    Py_ssize_t cap = nfields + (tag_value != NULL);
     int status = -1;
     MpStructSortItem *items = NULL;
+    Py_ssize_t n = 0;
 
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
 
-    if (cap > 0) {
-        items = PyMem_Malloc(cap * sizeof(MpStructSortItem));
-        if (items == NULL) { PyErr_NoMemory(); goto cleanup; }
-    }
-    Py_ssize_t n = 0;
-    if (tag_value != NULL) {
-        MpStructSortItem *it = &items[n++];
-        it->is_int = 0;
-        it->skey = unicode_str_and_size_nocheck(tag_field, &it->skey_size);
-        it->keyobj = tag_field;
-        it->val = tag_value;
-    }
-    for (Py_ssize_t i = 0; i < nfields; i++) {
-        PyObject *val = Struct_get_index(obj, i);
-        if (MS_UNLIKELY(val == NULL)) goto cleanup;
-        if (MS_UNLIKELY(val == UNSET)) continue;
-        if (omit_defaults && i >= npos
-                && is_default(val, PyTuple_GET_ITEM(defaults, i - npos))) {
-            continue;
-        }
-        MpStructSortItem *it = &items[n++];
-        PyObject *ik = PyTuple_GET_ITEM(int_keys, i);
-        if (ik != Py_None) {
-            it->is_int = 1;
-            it->ikey = PyLong_AsLongLong(ik);
-            it->keyobj = ik;
-        }
-        else {
-            it->is_int = 0;
-            it->skey = unicode_str_and_size_nocheck(PyTuple_GET_ITEM(fields, i), &it->skey_size);
-            it->keyobj = PyTuple_GET_ITEM(fields, i);
-        }
-        it->val = val;
-    }
-
-    /* insertion sort -- struct field counts are small */
-    for (Py_ssize_t i = 1; i < n; i++) {
-        MpStructSortItem tmp = items[i];
-        Py_ssize_t j = i;
-        while (j > 0 && _mp_struct_sortitem_lt(&tmp, &items[j - 1])) {
-            items[j] = items[j - 1];
-            j--;
-        }
-        items[j] = tmp;
-    }
+    if (struct_sorted_intkey_items(struct_type, obj, &items, &n) < 0) goto cleanup;
 
     if (ms_write(self, "{", 1) < 0) goto cleanup;
     if (n == 0) {
@@ -19517,8 +19497,9 @@ error:
     return NULL;
 }
 
-/* Resolve a JSON string object key that encodes an `int_keys` integer id (e.g.
- * "1") to a field index via the struct's int-key lookup.
+/* Resolve a string object key that encodes an `int_keys` integer id (e.g. "1")
+ * to a field index via the struct's int-key lookup. Shared by the JSON decoder
+ * and `convert`.
  *
  * Only the canonical decimal form that the encoder emits is recognized: an
  * optional leading '-', no leading zeros, no "-0", and a value within the
@@ -19528,7 +19509,7 @@ error:
  * decodes, while a key like "9223372036854775808" is treated as an unknown
  * field rather than silently wrapping onto a different field's id. */
 static Py_ssize_t
-json_struct_int_key_index(StructMetaObject *st_type, const char *key, Py_ssize_t key_size) {
+struct_int_key_index_from_str(StructMetaObject *st_type, const char *key, Py_ssize_t key_size) {
     /* Longest canonical keys: 19 digits, or '-' followed by 19 digits */
     if (key_size == 0 || key_size > 20) return -1;
     Py_ssize_t i = 0;
@@ -19630,7 +19611,7 @@ json_decode_struct_map_inner(
         /* Parse value */
         field_index = -1;
         if (MS_UNLIKELY(st_type->struct_int_key_lookup != NULL)) {
-            field_index = json_struct_int_key_index(st_type, key, key_size);
+            field_index = struct_int_key_index_from_str(st_type, key, key_size);
         }
         if (field_index < 0) {
             field_index = StructMeta_get_field_index(st_type, key, key_size, &pos);
@@ -20903,6 +20884,53 @@ to_builtins_frozendict(ToBuiltinsState *self, PyObject *obj) {
 }
 #endif
 
+/* Convert an int-keyed struct with `order='sorted'` to a dict. `sort_dict_inplace`
+ * can't be used here: sorting mixed int/str keys raises, and under `str_keys`
+ * the decimal strings would sort lexicographically ("10" < "2"). Reuses the
+ * encoders' ordering (integer keys ascending, then string keys) so the output
+ * key order matches `msgpack.encode` / `json.encode` with `order='sorted'`.
+ * Caller holds the recursion guard. */
+static PyObject *
+to_builtins_struct_sorted_intkeys(
+    ToBuiltinsState *self, StructMetaObject *struct_type, PyObject *obj
+) {
+    bool ok = false;
+    PyObject *out = NULL;
+    MpStructSortItem *items = NULL;
+    Py_ssize_t n = 0;
+
+    if (struct_sorted_intkey_items(struct_type, obj, &items, &n) < 0) return NULL;
+
+    out = PyDict_New();
+    if (out == NULL) goto cleanup;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *key = items[i].keyobj;
+        PyObject *key_str = NULL;
+        PyObject *val = to_builtins(self, items[i].val, false);
+        if (val == NULL) goto cleanup;
+        if (items[i].is_int && self->str_keys) {
+            key_str = PyObject_Str(key);
+            if (key_str == NULL) {
+                Py_DECREF(val);
+                goto cleanup;
+            }
+            key = key_str;
+        }
+        int status = PyDict_SetItem(out, key, val);
+        Py_DECREF(val);
+        Py_XDECREF(key_str);
+        if (status < 0) goto cleanup;
+    }
+    ok = true;
+
+cleanup:
+    if (items != NULL) PyMem_Free(items);
+    if (!ok) {
+        Py_CLEAR(out);
+    }
+    return out;
+}
+
 static PyObject *
 to_builtins_struct(ToBuiltinsState *self, PyObject *obj, bool is_key) {
     if (Py_EnterRecursiveCall(" while serializing an object")) return NULL;
@@ -20952,7 +20980,14 @@ to_builtins_struct(ToBuiltinsState *self, PyObject *obj, bool is_key) {
             }
         }
     }
+    else if (MS_UNLIKELY(
+        self->order == ORDER_SORTED && struct_type->struct_encode_int_keys != NULL
+    )) {
+        out = to_builtins_struct_sorted_intkeys(self, struct_type, obj);
+        if (out == NULL) goto cleanup;
+    }
     else {
+        PyObject *int_keys = struct_type->struct_encode_int_keys;
         out = PyDict_New();
         if (out == NULL) goto cleanup;
         if (tag_value != NULL) {
@@ -20970,7 +21005,31 @@ to_builtins_struct(ToBuiltinsState *self, PyObject *obj, bool is_key) {
             ) {
                 PyObject *val2 = to_builtins(self, val, false);
                 if (val2 == NULL) goto cleanup;
-                int status = PyDict_SetItem(out, key, val2);
+                int status;
+                if (MS_LIKELY(int_keys == NULL)) {
+                    status = PyDict_SetItem(out, key, val2);
+                }
+                else {
+                    /* A field with an `int_keys` entry is keyed by its integer
+                     * key (its decimal string under `str_keys`), matching the
+                     * msgpack and JSON encoders. Other fields keep their
+                     * encoded name. */
+                    PyObject *key_str = NULL;
+                    PyObject *ik = PyTuple_GET_ITEM(int_keys, i);
+                    if (ik != Py_None) {
+                        key = ik;
+                        if (self->str_keys) {
+                            key_str = PyObject_Str(ik);
+                            if (key_str == NULL) {
+                                Py_DECREF(val2);
+                                goto cleanup;
+                            }
+                            key = key_str;
+                        }
+                    }
+                    status = PyDict_SetItem(out, key, val2);
+                    Py_XDECREF(key_str);
+                }
                 Py_DECREF(val2);
                 if (status < 0) goto cleanup;
             }
@@ -21339,8 +21398,10 @@ PyDoc_STRVAR(msgspec_to_builtins__doc__,
 "conversion applies the same semantics as `msgspec.json.encode` and\n"
 "`msgspec.msgpack.encode`:\n"
 "\n"
-"- Struct-level settings are honored: ``rename``, ``omit_defaults``,\n"
-"  ``array_like``, and ``tag`` for tagged unions.\n"
+"- Struct-level settings are honored: ``rename``, ``int_keys``,\n"
+"  ``omit_defaults``, ``array_like``, and ``tag`` for tagged unions. Fields\n"
+"  configured with ``int_keys`` are keyed by their integer key (or its decimal\n"
+"  string when ``str_keys=True``).\n"
 "- Fields containing `msgspec.UNSET` are omitted from the output.\n"
 "- Nested `msgspec.Struct` / `dataclasses.dataclass` / attrs /\n"
 "  `typing.TypedDict` / `typing.NamedTuple` values are recursively\n"
@@ -22421,14 +22482,51 @@ convert_dict_to_struct(
 
     Py_ssize_t pos = 0, pos_obj = 0;
     PyObject *key_obj, *val_obj;
+    bool has_int_keys = struct_type->struct_int_key_lookup != NULL;
     while (PyDict_Next(obj, &pos_obj, &key_obj, &val_obj)) {
+        Py_ssize_t field_index = -1;
+
+        /* int_keys: an `int` key resolves through the int-key lookup, matching
+         * the msgpack decoder. Unknown integer keys are skipped (or rejected
+         * under `forbid_unknown_fields`). `bool` is excluded by the exact check
+         * and falls through to the usual "Expected `str`" error. */
+        if (MS_UNLIKELY(has_int_keys) && PyLong_CheckExact(key_obj)) {
+            PyObject *index_obj = IntLookup_GetPyInt(
+                (IntLookup *)struct_type->struct_int_key_lookup, key_obj
+            );
+            if (index_obj == NULL) {
+                if (MS_UNLIKELY(struct_type->forbid_unknown_fields == OPT_TRUE)) {
+                    ms_raise_validation_error(
+                        path, "Object contains unknown field `%R`%U", key_obj
+                    );
+                    goto error;
+                }
+                continue;
+            }
+            field_index = PyLong_AsSsize_t(index_obj);
+            PathNode field_path = {path, field_index, (PyObject *)struct_type};
+            PyObject *val = convert(
+                self, val_obj, info->types[field_index], &field_path
+            );
+            if (val == NULL) goto error;
+            Struct_set_index(out, field_index, val);
+            continue;
+        }
+
         if (!convert_is_str_key(key_obj, path)) goto error;
 
         Py_ssize_t key_size;
         const char *key = unicode_str_and_size(key_obj, &key_size);
         if (key == NULL) goto error;
 
-        Py_ssize_t field_index = StructMeta_get_field_index(struct_type, key, key_size, &pos);
+        /* int_keys: a canonical decimal string ("1") resolves to its field first,
+         * matching the JSON decoder; anything else is matched as a field name. */
+        if (MS_UNLIKELY(has_int_keys)) {
+            field_index = struct_int_key_index_from_str(struct_type, key, key_size);
+        }
+        if (field_index < 0) {
+            field_index = StructMeta_get_field_index(struct_type, key, key_size, &pos);
+        }
         if (field_index < 0) {
             if (MS_UNLIKELY(field_index == -2)) {
                 if (tag_already_read) continue;
@@ -22653,8 +22751,22 @@ convert_object_to_struct(
         fields = struct_type->struct_fields;
     }
 
+    /* int_keys: for mapping inputs, a field's integer key is tried before its
+     * name (mirroring `convert_dict_to_struct`). Attribute lookups have no
+     * integer form, so this is skipped under `from_attributes`. */
+    PyObject *int_keys = self->from_attributes ? NULL : struct_type->struct_encode_int_keys;
+
     for (Py_ssize_t i = 0; i < nfields; i++) {
         PyObject *field, *attr, *val;
+
+        if (MS_UNLIKELY(int_keys != NULL) && PyTuple_GET_ITEM(int_keys, i) != Py_None) {
+            attr = getter(obj, PyTuple_GET_ITEM(int_keys, i));
+            if (attr != NULL) {
+                field = PyTuple_GET_ITEM(struct_type->struct_fields, i);
+                goto got_attr;
+            }
+            PyErr_Clear();
+        }
 
         if (MS_LIKELY(fields != NULL)) {
             /* fields tuple already determined, just get the next field name */
@@ -22686,6 +22798,7 @@ convert_object_to_struct(
             }
         }
 
+got_attr:
         if (attr != NULL) {
             PathNode field_path = {path, PATH_STR, field};
             val = convert(self, attr, info->types[i], &field_path);
@@ -23088,6 +23201,11 @@ PyDoc_STRVAR(msgspec_convert__doc__,
 "-------\n"
 "Any\n"
 "    The converted object of the specified ``type``.\n"
+"\n"
+"Notes\n"
+"-----\n"
+"``Struct`` fields configured with ``int_keys`` are matched by their integer\n"
+"key, by its canonical decimal string (e.g. ``\"1\"``), or by their field name.\n"
 "\n"
 "Examples\n"
 "--------\n"

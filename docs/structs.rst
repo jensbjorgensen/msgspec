@@ -869,6 +869,8 @@ precedence.
     b'{"fieldX":1,"y":2}'
 
 
+.. _struct-int-keys:
+
 Integer Field Keys
 ------------------
 
@@ -938,10 +940,12 @@ collisions raise a ``ValueError`` at class definition:
 
 Generated :doc:`JSON schemas <jsonschema>` describe the encoded form: an
 int-keyed field appears under its decimal-string key (``"1"``), and is listed
-there in ``required`` if it has no default. The name alias is not part of the
-schema. Note that this means a schema generated with ``forbid_unknown_fields=True``
-(``additionalProperties: false``) rejects alias-keyed messages that msgspec itself
-would still accept.
+there in ``required`` if it has no default. Field defaults are rendered in
+encoded form as well, so a default that is itself an int-keyed struct appears
+under its integer keys. The name alias is not part of the schema. Note that
+this means a schema generated with ``forbid_unknown_fields=True``
+(``additionalProperties: false``) rejects alias-keyed messages that msgspec
+itself would still accept.
 
 .. code-block:: python
 
@@ -965,6 +969,23 @@ A few things to note:
   encoded name or the ``tag_field`` as described above.
 - ``int_keys`` cannot be combined with ``array_like=True`` (array-encoded structs
   have no field keys); doing so raises a ``ValueError`` at class definition.
+- `msgspec.to_builtins` and `msgspec.convert` honor ``int_keys`` the same way the
+  encoders and decoders do, so protocols built on them (including
+  :mod:`msgspec.yaml` and :mod:`msgspec.toml`) get the compact keys as well.
+  ``to_builtins`` keys int-keyed fields by their integer key, or by its decimal
+  string when ``str_keys=True``. ``convert`` accepts the integer key, its
+  canonical decimal string, or the field name.
+
+  .. code-block:: python
+
+      >>> msgspec.to_builtins(Point(1, 2))
+      {1: 1, 2: 2}
+
+      >>> msgspec.to_builtins(Point(1, 2), str_keys=True)
+      {'1': 1, '2': 2}
+
+      >>> msgspec.convert({1: 1, 2: 2}, Point)
+      Point(x=1, y=2)
 
 The assigned key for each field is available via introspection through the
 ``int_key`` attribute of `msgspec.structs.FieldInfo`:
