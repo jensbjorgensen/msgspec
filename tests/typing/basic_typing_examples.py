@@ -344,6 +344,7 @@ def check_struct_attributes() -> None:
         y: int
 
     assert_type(Point.__struct_fields__, tuple[str, ...])
+    assert_type(Point.__struct_defaults__, tuple[Any, ...])
     assert_type(Point.__struct_encode_int_keys__, tuple[int | None, ...] | None)
 
     for field in Point.__match_args__:
@@ -355,6 +356,7 @@ def check_struct_attributes() -> None:
 
     assert_type(p.__struct_fields__, tuple[str, ...])
     assert_type(p.__struct_encode_fields__, tuple[str, ...])
+    assert_type(p.__struct_defaults__, tuple[Any, ...])
 
 
 def check_struct_config() -> None:
@@ -477,6 +479,8 @@ def check_asdict() -> None:
     assert_type(o, dict[str, Any])
     assert_type(o["foo"], Any)
 
+    msgspec.structs.asdict(struct=x)  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[unexpected-keyword]
+
 
 def check_astuple() -> None:
     class Test(msgspec.Struct):
@@ -488,6 +492,8 @@ def check_astuple() -> None:
     assert_type(o, tuple[Any, ...])
     assert_type(o[0], Any)
 
+    msgspec.structs.astuple(struct=x)  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[unexpected-keyword]
+
 
 def check_force_setattr() -> None:
     class Point(msgspec.Struct, frozen=True):
@@ -496,6 +502,8 @@ def check_force_setattr() -> None:
 
     obj = Point(1, 2)
     msgspec.structs.force_setattr(obj, "x", 3)
+
+    msgspec.structs.force_setattr(struct=obj, name="x", value=3)  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[unexpected-keyword]
 
 
 def check_fields() -> None:
@@ -542,11 +550,54 @@ def check_meta_constructor() -> None:
         msgspec.Meta(extra_json_schema=val6)
         msgspec.Meta(extra=val6)
 
+    Meta = msgspec.Meta
+
+    # Numeric cases:
+    Meta(gt=1, lt=5)
+    Meta(gt=1, le=5)
+    Meta(ge=1, lt=5)
+    Meta(ge=1, le=5)
+
+    Meta(gt=1, lt=5, multiple_of=2)
+    Meta(gt=1, le=5, multiple_of=0.5)
+    Meta(ge=1.0, lt=5.0, multiple_of=0.5)
+    Meta(
+        ge=1,
+        le=5,
+        multiple_of=1,
+        title='title',
+        examples=[1, 2],
+        description='descr',
+        extra={},
+        extra_json_schema={},
+    )
+
+    # Other:
+    Meta(min_length=1, max_length=5)
+    Meta(
+        min_length=1,
+        max_length=5,
+        title='title',
+        examples=[1, 2],
+        description='descr',
+        extra={'extra': 'extra'},
+        extra_json_schema={'extra': 'extra'},
+    )
+
+    # Invalid cases:
+    Meta(gt=1, ge=5)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
+    Meta(le=1, lt=5)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
+
+    Meta(le=1, min_length=1)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
+    Meta(gt=1.0, max_length=1.5)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
+    Meta(multiple_of=1, max_length=1.5)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
+
 
 def check_meta_attributes() -> None:
     c = msgspec.Meta()
     assert_type(c.title, str | None)
     assert_type(c.description, str | None)
+    assert_type(c.tz, bool | None)
 
 
 def check_meta_equal() -> None:
@@ -571,6 +622,8 @@ def check_raw_constructor() -> None:
     r3 = msgspec.Raw(bytearray(b"test"))
     r4 = msgspec.Raw(memoryview(b"test"))
     r2 = msgspec.Raw("test")
+
+    msgspec.Raw(msg=b"test")  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[no-matching-overload]
 
 
 def check_raw_copy() -> None:
@@ -608,6 +661,7 @@ def check_msgpack_Encoder_encode_into() -> None:
     buf = bytearray(48)
     enc.encode_into([1, 2, 3], buf)
     enc.encode_into([1, 2, 3], buf, 2)
+    enc.encode_into([1, 2, 3], buf, None)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
 
 
 def check_msgpack_encode() -> None:
@@ -745,6 +799,8 @@ def check_msgpack_Ext() -> None:
     assert_type(msgspec.msgpack.Ext(1, memoryview(b'')), msgspec.msgpack.Ext)
     assert_type(msgspec.msgpack.Ext(1, array.array('i', [1, 2, 3])), msgspec.msgpack.Ext)
 
+    msgspec.msgpack.Ext(code=1, data=b"test")  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[unexpected-keyword]
+
     # Non buffers:
     msgspec.msgpack.Ext(1, {})  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
 
@@ -775,6 +831,7 @@ def check_json_Encoder_encode_into() -> None:
     buf = bytearray(48)
     enc.encode_into([1, 2, 3], buf)
     enc.encode_into([1, 2, 3], buf, 2)
+    enc.encode_into([1, 2, 3], buf, None)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
 
 
 def check_json_encode() -> None:

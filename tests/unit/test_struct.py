@@ -946,6 +946,90 @@ def test_struct_reference_counting():
     assert sys.getrefcount(data) <= 4
 
 
+def test_struct_definition_does_not_leak_annotations():
+    """Defining a struct type must not retain its `__annotations__` dict"""
+
+    class Annotation:
+        pass
+
+    ref = weakref.ref(Annotation)
+
+    cls = defstruct("Temp", [("x", Annotation)])
+    del cls, Annotation
+    gc.collect()
+
+    assert ref() is None
+
+
+def test_struct_definition_does_not_leak_class_body_annotations():
+    """A class body must not retain the annotations built for it"""
+
+    def define_struct_type():
+        class Annotation:
+            pass
+
+        class Example(Struct):
+            x: Annotation
+
+        return weakref.ref(Annotation)
+
+    refs = [define_struct_type() for _ in range(3)]
+    gc.collect()
+
+    assert [ref() for ref in refs] == [None, None, None]
+
+
+@pytest.mark.parametrize("spelling", ["ClassVar", "typing.ClassVar"])
+def test_struct_definition_does_not_leak_module_namespace(spelling):
+    """A string `ClassVar` annotation must not retain the module namespace"""
+
+    class Sentinel:
+        pass
+
+    def define_in_temp_module():
+        with temp_module(
+            "import typing\nfrom typing import ClassVar\nimport msgspec\n"
+        ) as mod:
+            sentinel = Sentinel()
+            mod.__dict__["sentinel"] = sentinel
+            exec(
+                "from __future__ import annotations\n"
+                "class Ex(msgspec.Struct):\n"
+                f"    a: {spelling}[int] = 1\n"
+                "    x: int = 0\n",
+                mod.__dict__,
+            )
+            # The leak only exists while the annotations are strings
+            assert mod.Ex.__annotations__["x"] == "int"
+            return weakref.ref(sentinel)
+
+    refs = [define_in_temp_module() for _ in range(3)]
+    gc.collect()
+
+    assert [ref() for ref in refs] == [None, None, None]
+
+
+def test_struct_definition_does_not_leak_non_struct_base_dict():
+    """Defining a struct must not retain the type dict of a non-struct base"""
+
+    class Sentinel:
+        pass
+
+    def define_struct_type():
+        sentinel = Sentinel()
+        Mixin = type("Mixin", (), {"sentinel": sentinel})
+
+        class Example(Mixin, Struct):
+            x: int
+
+        return weakref.ref(sentinel)
+
+    refs = [define_struct_type() for _ in range(3)]
+    gc.collect()
+
+    assert [ref() for ref in refs] == [None, None, None]
+
+
 def test_struct_gc_not_added_if_not_needed():
     """Structs aren't tracked by GC until/unless they reference a container type"""
 
@@ -1114,6 +1198,67 @@ class TestStructGC:
 
             class Test(Base, **opts):
                 pass
+
+    @staticmethod
+    def assert_gc_false_with_weakref_rejected(base, **opts):
+        with pytest.raises(ValueError, match="Cannot set gc=False and weakref=True"):
+
+            class Test(base, **opts):
+                pass
+
+    def test_struct_gc_false_forbids_weakref_true(self):
+        self.assert_gc_false_with_weakref_rejected(Struct, gc=False, weakref=True)
+
+    def test_struct_gc_false_forbids_weakref_base(self):
+        class Base(Struct, weakref=True):
+            pass
+
+        self.assert_gc_false_with_weakref_rejected(Base, gc=False)
+
+    def test_struct_gc_false_base_forbids_weakref_true(self):
+        class Base(Struct, gc=False):
+            pass
+
+        self.assert_gc_false_with_weakref_rejected(Base, weakref=True)
+
+    def test_struct_gc_false_forbids_weakref_grandparent(self):
+        class Grandparent(Struct, weakref=True):
+            pass
+
+        class Base(Grandparent):
+            pass
+
+        self.assert_gc_false_with_weakref_rejected(Base, gc=False)
+
+    def test_struct_gc_false_forbids_weakref_slot_from_mixin(self):
+        class Mixin:
+            __slots__ = ("__weakref__",)
+
+        class Base(Mixin, Struct):
+            pass
+
+        self.assert_gc_false_with_weakref_rejected(Base, gc=False)
+
+    def test_struct_gc_false_forbids_weakref_true_defstruct(self):
+        with pytest.raises(ValueError, match="Cannot set gc=False and weakref=True"):
+            defstruct("Test", ["x"], gc=False, weakref=True)
+
+    def test_struct_gc_false_and_weakref_still_allowed_apart(self):
+        class NoGC(Struct, gc=False):
+            x: list
+
+        class SubNoGC(NoGC, gc=False):
+            y: list
+
+        class WithWeakRef(Struct, weakref=True):
+            x: list
+
+        assert not gc.is_tracked(NoGC([1]))
+        assert not gc.is_tracked(SubNoGC([1], [2]))
+
+        obj = WithWeakRef([1])
+        assert gc.is_tracked(obj)
+        assert weakref.ref(obj)() is obj
 
 
 class TestStructDealloc:
@@ -2102,6 +2247,29 @@ class TestRename:
 
         assert Test4.__struct_encode_fields__ == ("my_field",)
 
+    def test_field_name_override_inherited(self):
+        class Base(Struct):
+            x: int = field(name="_x")
+
+        class Test1(Base):
+            x: int = field(name="x")
+
+        assert Test1.__struct_encode_fields__ == ("x",)
+
+        class Test2(Base):
+            x: int = 1
+
+        assert Test2.__struct_encode_fields__ == ("_x",)
+
+    def test_rename_override_inherited(self):
+        class Base(Struct, rename="upper"):
+            x: int
+
+        class Test(Base, rename="lower"):
+            x: int
+
+        assert Test.__struct_encode_fields__ == ("x",)
+
     def test_rename_fields_only_used_for_encode_and_decode(self):
         """Check that the renamed fields don't show up elsewhere"""
 
@@ -2888,3 +3056,96 @@ class TestPostInit:
         x2 = x1.__copy__()
         assert x1 == x2
         assert count == 1
+
+
+class TestForwardReferences:
+    """Quoted forward refs work on all supported Pythons. Unquoted forward
+    refs are only valid under PEP 649 deferred annotations (3.14+).
+    """
+
+    def test_quoted_forward_reference_struct_fields(self):
+        source = """
+        import msgspec
+
+        class Outer(msgspec.Struct):
+            inner: "Inner"
+
+        class Inner(msgspec.Struct):
+            value: int
+        """
+        with temp_module(source) as mod:
+            assert mod.Outer.__struct_fields__ == ("inner",)
+            msg = mod.Outer(mod.Inner(1))
+            assert msgspec.json.decode(msgspec.json.encode(msg), type=mod.Outer) == msg
+
+    def test_future_annotations_forward_reference_struct_fields(self):
+        source = """
+        from __future__ import annotations
+        import msgspec
+
+        class Outer(msgspec.Struct):
+            inner: Inner
+
+        class Inner(msgspec.Struct):
+            value: int
+        """
+        with temp_module(source) as mod:
+            assert mod.Outer.__struct_fields__ == ("inner",)
+            msg = mod.Outer(mod.Inner(1))
+            assert msgspec.json.decode(msgspec.json.encode(msg), type=mod.Outer) == msg
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14),
+        reason="unquoted forward references require PEP 649 (Python 3.14+)",
+    )
+    def test_unquoted_forward_reference_struct_fields(self):
+        source = """
+        import msgspec
+
+        class Outer(msgspec.Struct):
+            inner: Inner
+
+        class Inner(msgspec.Struct):
+            value: int
+        """
+        with temp_module(source) as mod:
+            assert mod.Outer.__struct_fields__ == ("inner",)
+            assert mod.Outer.__annotations__["inner"] is mod.Inner
+            msg = mod.Outer(mod.Inner(1))
+            assert msgspec.json.decode(msgspec.json.encode(msg), type=mod.Outer) == msg
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14),
+        reason="unquoted forward references require PEP 649 (Python 3.14+)",
+    )
+    def test_unquoted_forward_reference_generic_container(self):
+        source = """
+        import msgspec
+
+        class Outer(msgspec.Struct):
+            items: list[Inner]
+
+        class Inner(msgspec.Struct):
+            value: int
+        """
+        with temp_module(source) as mod:
+            assert mod.Outer.__struct_fields__ == ("items",)
+            msg = mod.Outer([mod.Inner(1), mod.Inner(2)])
+            assert msgspec.json.decode(msgspec.json.encode(msg), type=mod.Outer) == msg
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14),
+        reason="unquoted forward references require PEP 649 (Python 3.14+)",
+    )
+    def test_unquoted_mutual_forward_references(self):
+        source = """
+        import msgspec
+
+        class Node(msgspec.Struct):
+            value: int
+            child: Node | None = None
+        """
+        with temp_module(source) as mod:
+            assert mod.Node.__struct_fields__ == ("value", "child")
+            msg = mod.Node(1, mod.Node(2))
+            assert msgspec.json.decode(msgspec.json.encode(msg), type=mod.Node) == msg

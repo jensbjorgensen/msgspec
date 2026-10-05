@@ -6,6 +6,7 @@ import datetime
 import decimal
 import enum
 import gc
+import inspect
 import sys
 import textwrap
 import types
@@ -38,6 +39,7 @@ from .utils import (
     max_call_depth,
     py315_or_later_only,
     temp_module,
+    win_arm64_py312_stack_limited,
 )
 
 try:
@@ -2789,6 +2791,21 @@ class TestStructDefaults:
 
 
 class TestTypedDict:
+    def test_postponed_annotations(self, proto):
+        # Regression test for Python 3.12.0-3.12.3, where the fourth argument
+        # to typing._eval_type is recursive_guard rather than type_params.
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict
+
+        class Ex(TypedDict):
+            x: int
+        """
+
+        with temp_module(source) as mod:
+            msg = proto.encode({"x": 1})
+            assert proto.decode(msg, type=mod.Ex) == {"x": 1}
+
     def test_types_generic_alias_non_generic_errors(self):
         # mostly a smoke test to weed out some bogus stuff that may get passed to us.
         # parametrising a non-generic TypedDict via a manually-built
@@ -3085,6 +3102,37 @@ class TestTypedDict:
 
         with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
             proto.decode(msg, type=Ex[str])
+
+    @py312_plus
+    def test_generic_with_typevar_syntax(self, proto):
+        # `from __future__ import annotations` is load-bearing: it triggers the
+        # module-bound ForwardRefs that previously failed to resolve `T`.
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict
+        class Ex[T](TypedDict):
+            x: T
+            y: list[T]
+        """
+
+        with temp_module(source) as mod:
+            sol = mod.Ex(x=1, y=[1, 2])
+            msg = proto.encode(sol)
+
+            res = proto.decode(msg, type=mod.Ex)
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[int])
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[Union[int, str]])
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[float])
+            assert type(res["x"]) is float
+
+            with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+                proto.decode(msg, type=mod.Ex[str])
 
     def test_recursive_generic_typeddict(self, proto):
         pytest.importorskip("typing_extensions")
@@ -3520,6 +3568,18 @@ class TestDataclass:
         res = proto.encode(x)
         sol = proto.encode(msg)
         assert res == sol
+
+    def test_encode_non_dataclass_skips_instance_getattr(self, proto):
+        calls = []
+
+        class Ex:
+            def __getattr__(self, key):
+                calls.append(key)
+                raise AttributeError(key)
+
+        res = proto.encode([Ex()], enc_hook=lambda x: "hook")
+        assert res == proto.encode(["hook"])
+        assert calls == []
 
     @pytest.mark.parametrize("field", "xyz")
     def test_encode_dataclass_invalid_field_errors(self, proto, field):
@@ -4746,6 +4806,7 @@ class TestTypeAlias:
         ],
     )
     @emscripten_stack_limited
+    @win_arm64_py312_stack_limited
     def test_recursive_typealias_errors(self, src):
         """Eventually we should support this, but for now just test that it
         errors cleanly"""
@@ -5627,3 +5688,62 @@ class TestFrozendict:
         msg = proto.encode(frozendict({"abc": "xyz"}))
         with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
             dec.decode(msg)
+
+
+@pytest.mark.parametrize(
+    "func, expected",
+    [
+        pytest.param(msgspec.Raw, "(msg=b'', /)", id="Raw"),
+        pytest.param(msgspec.msgpack.Ext, "(code, data, /)", id="Ext"),
+        pytest.param(msgspec.structs.replace, "(struct, /, **changes)", id="replace"),
+        pytest.param(msgspec.structs.asdict, "(struct, /)", id="asdict"),
+        pytest.param(msgspec.structs.astuple, "(struct, /)", id="astuple"),
+        pytest.param(
+            msgspec.structs.force_setattr,
+            "(struct, name, value, /)",
+            id="force_setattr",
+        ),
+        pytest.param(msgspec.Raw(b"1").copy, "()", id="Raw.copy"),
+        pytest.param(
+            msgspec.json.Encoder().encode, "(obj, /)", id="json.Encoder.encode"
+        ),
+        pytest.param(
+            msgspec.json.Encoder().encode_into,
+            "(obj, buffer, offset=0, /)",
+            id="json.Encoder.encode_into",
+        ),
+        pytest.param(
+            msgspec.json.Encoder().encode_lines,
+            "(items, /)",
+            id="json.Encoder.encode_lines",
+        ),
+        pytest.param(
+            msgspec.json.Decoder().decode, "(buf, /)", id="json.Decoder.decode"
+        ),
+        pytest.param(
+            msgspec.json.Decoder().decode_lines,
+            "(buf, /)",
+            id="json.Decoder.decode_lines",
+        ),
+        pytest.param(
+            msgspec.msgpack.Encoder().encode, "(obj, /)", id="msgpack.Encoder.encode"
+        ),
+        pytest.param(
+            msgspec.msgpack.Encoder().encode_into,
+            "(obj, buffer, offset=0, /)",
+            id="msgpack.Encoder.encode_into",
+        ),
+        pytest.param(
+            msgspec.msgpack.Decoder().decode, "(buf, /)", id="msgpack.Decoder.decode"
+        ),
+    ],
+)
+def test_reported_signature(func, expected):
+    """The reported signature must match how the callable is really called"""
+    assert str(inspect.signature(func)) == expected
+
+
+def test_structmeta_text_signature_is_valid():
+    """`StructMeta` has a `__signature__` getset, so only the text form is checkable"""
+    text_signature = msgspec.StructMeta.__text_signature__
+    exec(compile(f"def _f{text_signature}: pass", "<signature>", "exec"), {})

@@ -27,7 +27,7 @@ _DecimalFormatSig: TypeAlias = (
 class Ext:
     code: int
     data: Buffer
-    def __init__(self, code: int, data: Buffer) -> None: ...
+    def __init__(self, code: int, data: Buffer, /) -> None: ...
 
 @final
 class Decoder(Generic[_T]):
@@ -71,9 +71,7 @@ class Encoder:
         order: Literal["deterministic", "sorted"] | None = None,
     ) -> None: ...
     def encode(self, obj: Any, /) -> bytes: ...
-    def encode_into(
-        self, obj: Any, buffer: bytearray, offset: int | None = 0, /
-    ) -> None: ...
+    def encode_into(self, obj: Any, buffer: bytearray, offset: int = 0, /) -> None: ...
 
 @overload
 def decode(
